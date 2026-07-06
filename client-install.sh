@@ -128,6 +128,12 @@ fi
 
 PLIST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 mkdir -p "$HOME/Library/LaunchAgents"
+# launchd runs with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin); the electron
+# shim's `#!/usr/bin/env node` needs node ON that PATH, but node from nodejs.org
+# (/usr/local/bin), Homebrew (/opt/homebrew/bin), or nvm is NOT there — so the
+# app silently fails to autostart with "env: node: No such file or directory".
+# Pin the detected node dir into the agent's PATH so autostart finds it.
+NODE_BIN_DIR="$(cd "$(dirname "$(command -v node)")" 2>/dev/null && pwd || echo /usr/local/bin)"
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -139,6 +145,10 @@ cat > "$PLIST" <<EOF
     <string>$CLIENT_DIR/node_modules/.bin/electron</string>
     <string>$CLIENT_DIR</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$NODE_BIN_DIR:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$HOME/.atlas/logs/client.log</string>
   <key>StandardErrorPath</key><string>$HOME/.atlas/logs/client.err</string>
