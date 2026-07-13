@@ -107,8 +107,14 @@ if [[ -d "$APP_PATH" ]]; then
   # Quit a running Atlas so the moved-aside bundle isn't the live one.
   osascript -e 'tell application "Atlas" to quit' >/dev/null 2>&1 || true
   sleep 1
-  mv "$APP_PATH" "$APP_PATH.prev.$(date +%Y%m%d%H%M%S)"
-  warn "existing Atlas.app moved aside (never deleted)"
+  # Park OUT of /Applications: a parked bundle there haunts Spotlight and
+  # Launchpad as a ghost "Atlas" (blank-icon helper apps included — field
+  # find 2026-07-12). ~/.atlas/previous.noindex is invisible to Spotlight
+  # (.noindex) and still never deleted.
+  PARK="$HOME/.atlas/previous.noindex"
+  mkdir -p "$PARK"
+  mv "$APP_PATH" "$PARK/Atlas.app.prev.$(date +%Y%m%d%H%M%S)"
+  warn "existing Atlas.app parked in $PARK (never deleted)"
 fi
 # ditto preserves the bundle's code signature (cp -R can break it on the
 # framework symlinks), and the tarball extracts onto tmpfs, so copy properly.
@@ -118,8 +124,10 @@ ok "installed $APP_PATH"
 # The previous layout (~/atlas-client, raw electron via npm) is superseded —
 # move it aside so nothing points at it. Never deleted.
 if [[ -d "$HOME/atlas-client" ]]; then
-  mv "$HOME/atlas-client" "$HOME/atlas-client.prev.$(date +%Y%m%d%H%M%S)"
-  warn "old-style install ~/atlas-client moved aside (superseded by Atlas.app)"
+  PARK="$HOME/.atlas/previous.noindex"
+  mkdir -p "$PARK"
+  mv "$HOME/atlas-client" "$PARK/atlas-client.prev.$(date +%Y%m%d%H%M%S)"
+  warn "old-style install ~/atlas-client parked in $PARK (superseded by Atlas.app)"
 fi
 
 # ── [3/4] Connection config ─────────────────────────────────────────────────
