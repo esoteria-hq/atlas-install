@@ -23,11 +23,13 @@
 
 set -euo pipefail
 
+# ASCII-only status glyphs: multi-byte unicode (✓ ⚠ › ═) mojibakes in
+# non-UTF-8 terminals and made a working install read as garbled/failed.
 bold()  { printf "\033[1m%s\033[0m\n" "$*"; }
-ok()    { printf "\033[32m✓\033[0m %s\n" "$*"; }
-warn()  { printf "\033[33m⚠\033[0m %s\n" "$*"; }
-fail()  { printf "\033[31m✗\033[0m %s\n" "$*"; exit 1; }
-step()  { printf "\n\033[1;34m›\033[0m \033[1m%s\033[0m\n" "$*"; }
+ok()    { printf "\033[32m[ok]\033[0m %s\n" "$*"; }
+warn()  { printf "\033[33m[!]\033[0m %s\n" "$*"; }
+fail()  { printf "\033[31m[x]\033[0m %s\n" "$*"; exit 1; }
+step()  { printf "\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n" "$*"; }
 
 REPO="${ATLAS_INSTALL_REPO:-esoteria-hq/atlas-install}"
 TARBALL_ASSET="atlas-client.tar.gz"
@@ -53,9 +55,9 @@ else
   SHA_URL="https://github.com/$REPO/releases/latest/download/$SHA_ASSET"
 fi
 
-bold "═══════════════════════════════════════════════════════════════"
-bold "  Atlas — thin client installer (server mode)"
-bold "═══════════════════════════════════════════════════════════════"
+bold "==============================================================="
+bold "  Atlas - thin client installer (server mode)"
+bold "==============================================================="
 
 # ── [1/4] Sanity ────────────────────────────────────────────────────────────
 step "[1/4] Sanity"
@@ -77,6 +79,19 @@ if [[ -z "$TOKEN" && -r /dev/tty ]]; then
 fi
 [[ "$SERVER_URL" =~ ^https?:// ]] || fail "ATLAS_SERVER_URL must start with http:// or https://"
 [[ -n "$TOKEN" ]] || fail "ATLAS_CLIENT_TOKEN is required (esoteria gives you this once)"
+
+# The desktop UI's Content-Security-Policy (connect-src) allows only *.ts.net
+# names (+ loopback) — a RAW tailnet IP produces an install that looks healthy
+# (curl/health returns 200, background pollers connect) but whose UI can never
+# reach the server and shows "You're offline". Resolve the known server IP to
+# its MagicDNS name; reject any other raw IP rather than ship a broken install.
+SERVER_HOST="${SERVER_URL#*://}"; SERVER_HOST="${SERVER_HOST%%[:/]*}"
+if [[ "$SERVER_HOST" == "100.111.77.47" ]]; then
+  SERVER_URL="${SERVER_URL/100.111.77.47/atlas-server-1.tailc0f037.ts.net}"
+  warn "using the server's MagicDNS name instead of its raw IP (the app only allows *.ts.net): $SERVER_URL"
+elif [[ "$SERVER_HOST" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+  fail "ATLAS_SERVER_URL points at a raw IP ($SERVER_HOST). Atlas needs the server's MagicDNS name (e.g. http://atlas-server-1.tailc0f037.ts.net:8443) — the app blocks raw IPs, so an IP install can't connect from the UI even though the server is up. Ask esoteria for the .ts.net address."
+fi
 ok "server + token provided"
 
 # Tailscale is the usual path to the server (the URL is a tailnet name).
