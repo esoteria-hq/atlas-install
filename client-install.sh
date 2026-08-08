@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 #
-# Atlas THIN-CLIENT one-line installer (macOS) — server mode, ADR-097.
+# Atlas THIN-CLIENT one-line installer (macOS) — server mode, ADR-097;
+# public HTTPS door (spec 2026-08-07).
 #
-#   ATLAS_SERVER_URL='http://<server>:8443' ATLAS_CLIENT_TOKEN='<token>' \
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/esoteria-hq/atlas-install/main/client-install.sh)"
+#   ATLAS_CLIENT_TOKEN='<token>' \
+#   bash -c "$(curl -fsSL https://atlas.esoteria.ai/install)"
+#
+# The server URL defaults to the public door (https://atlas.esoteria.ai) — the
+# token is the only thing esoteria hands you. Legacy tailnet installs may still
+# pass ATLAS_SERVER_URL='http://<name>.ts.net:8443' explicitly.
 #
 # What lands on the Mac is a real app: Atlas.app (packaged by scripts/
 # package-client.sh — a signed-identity Electron bundle with its own Dock
@@ -15,7 +20,8 @@
 # isolated profile, and your Mac is the microphone + screen for it.
 #
 # Environment:
-#   ATLAS_SERVER_URL        required — your Atlas server (from esoteria)
+#   ATLAS_SERVER_URL        optional — your Atlas server (default: the public
+#                           door https://atlas.esoteria.ai; tailnet URLs OK)
 #   ATLAS_CLIENT_TOKEN      required — your personal bearer token (shown once)
 #   ATLAS_APP_DIR           where Atlas.app goes (default: /Applications when
 #                           writable, else ~/Applications)
@@ -34,6 +40,7 @@ fail()  { printf "\033[31m[x]\033[0m %s\n" "$*"; exit 1; }
 step()  { printf "\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n" "$*"; }
 
 REPO="${ATLAS_INSTALL_REPO:-esoteria-hq/atlas-install}"
+DEFAULT_SERVER_URL="https://atlas.esoteria.ai"
 TARBALL_ASSET="atlas-client.tar.gz"
 SHA_ASSET="atlas-client.tar.gz.sha256"
 PLIST_LABEL="com.esoteria.atlas.client"
@@ -101,6 +108,28 @@ atlas_running_paths() {
   return 0
 }
 
+# ── The parking lot has a size limit now ────────────────────────────────────
+# Parks used to be "never deleted" — and on one Mac that reached 4.3 GB across
+# 15 bundles in three weeks, silently, in a Spotlight-invisible directory.
+# Keep the newest PARK_KEEP entries (enough for a one-step rollback plus one)
+# and drop the rest. Newest means the name's trailing date +%Y%m%d%H%M%S
+# stamp, NOT the raw name: "atlas-client.prev.*" sorts after
+# "Atlas.app.prev.*" in ASCII, so a raw-name sort would keep a months-old
+# legacy park over yesterday's bundle.
+PARK_KEEP=2
+prune_park() {
+  local park="$HOME/.atlas/previous.noindex" entry n=0
+  [ -d "$park" ] || return 0
+  while IFS= read -r entry; do
+    case "$entry" in ''|.|..|*/*) continue ;; esac
+    n=$((n + 1))
+    if [ "$n" -gt "$PARK_KEEP" ]; then
+      rm -rf "$park/${entry:?}"
+      warn "dropped old parked bundle $entry (keeping the newest $PARK_KEEP)"
+    fi
+  done < <(ls -1 "$park" 2>/dev/null | awk -F. '{ print $NF "\t" $0 }' | sort -r | cut -f2-)
+}
+
 # Atlas.app's home: /Applications when this user can write it, else the
 # per-user ~/Applications (always writable, no sudo either way).
 if [[ -n "${ATLAS_APP_DIR:-}" ]]; then
@@ -131,12 +160,17 @@ ok "macOS"
 command -v curl >/dev/null || fail "curl is required"
 ok "curl"
 
-SERVER_URL="${ATLAS_SERVER_URL:-}"
+# The public door is the DEFAULT: the token is the only thing a new client is
+# given. An explicit ATLAS_SERVER_URL still wins, which is what keeps legacy
+# tailnet installs working unchanged.
+SERVER_URL="${ATLAS_SERVER_URL:-$DEFAULT_SERVER_URL}"
+# Strip trailing slashes ONCE, here, before anything concatenates a path onto
+# this. `https://atlas.esoteria.ai/` is what a human copies out of a browser, and
+# it turns the reachability probe below into `…ai//gateway/health` (404 on Caddy
+# -> the install fails against a perfectly healthy server) and lands the same
+# double slash in every URL the app builds from client.json.
+while [[ "$SERVER_URL" == */ ]]; do SERVER_URL="${SERVER_URL%/}"; done
 TOKEN="${ATLAS_CLIENT_TOKEN:-}"
-if [[ -z "$SERVER_URL" && -r /dev/tty ]]; then
-  printf "Atlas server URL (from esoteria, e.g. http://atlas-hq:8443): "
-  read -r SERVER_URL < /dev/tty
-fi
 if [[ -z "$TOKEN" && -r /dev/tty ]]; then
   printf "Your access token (never echoed): "
   read -rs TOKEN < /dev/tty
@@ -145,21 +179,22 @@ fi
 [[ "$SERVER_URL" =~ ^https?:// ]] || fail "ATLAS_SERVER_URL must start with http:// or https://"
 [[ -n "$TOKEN" ]] || fail "ATLAS_CLIENT_TOKEN is required (esoteria gives you this once)"
 
-# The desktop UI's Content-Security-Policy (connect-src) allows only *.ts.net
-# names (+ loopback) — a RAW tailnet IP produces an install that looks healthy
+# The desktop UI's Content-Security-Policy (connect-src) allows only the public
+# door + *.ts.net names (+ loopback) — a RAW IP produces an install that looks healthy
 # (curl/health returns 200, background pollers connect) but whose UI can never
 # reach the server and shows "You're offline". Resolve the known server IP to
 # its MagicDNS name; reject any other raw IP rather than ship a broken install.
 SERVER_HOST="${SERVER_URL#*://}"; SERVER_HOST="${SERVER_HOST%%[:/]*}"
 if [[ "$SERVER_HOST" == "100.111.77.47" ]]; then
   SERVER_URL="${SERVER_URL/100.111.77.47/atlas-server-1.tailc0f037.ts.net}"
-  warn "using the server's MagicDNS name instead of its raw IP (the app only allows *.ts.net): $SERVER_URL"
+  warn "using the server's MagicDNS name instead of its raw IP (the app blocks raw IPs): $SERVER_URL"
 elif [[ "$SERVER_HOST" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-  fail "ATLAS_SERVER_URL points at a raw IP ($SERVER_HOST). Atlas needs the server's MagicDNS name (e.g. http://atlas-server-1.tailc0f037.ts.net:8443) — the app blocks raw IPs, so an IP install can't connect from the UI even though the server is up. Ask esoteria for the .ts.net address."
+  fail "ATLAS_SERVER_URL points at a raw IP ($SERVER_HOST). The app blocks raw IPs, so an IP install can't connect from the UI even though the server is up. Use the public door ($DEFAULT_SERVER_URL) or, for a legacy tailnet install, the server's .ts.net name."
 fi
 ok "server + token provided"
 
-# Tailscale is the usual path to the server (the URL is a tailnet name).
+# Legacy tailnet installs ONLY (the URL is a tailnet name): Tailscale must be on
+# this Mac to reach the server. The public door needs nothing installed.
 if [[ "$SERVER_URL" == *"ts.net"* || "$SERVER_URL" == *"://100."* ]]; then
   if ! command -v tailscale >/dev/null && [ ! -d "/Applications/Tailscale.app" ]; then
     warn "your server address looks like Tailscale, but Tailscale isn't installed."
@@ -169,6 +204,36 @@ if [[ "$SERVER_URL" == *"ts.net"* || "$SERVER_URL" == *"://100."* ]]; then
     ok "tailscale present"
   fi
 fi
+
+# Reach the server BEFORE downloading 113 MB and writing config. Without this,
+# an unreachable server produces the exact failure the raw-IP guard above exists
+# to prevent: every line prints [ok], the app launches, and the only symptom is a
+# UI stuck on "You're offline" with nothing explaining why.
+#
+# The public door makes this reachable-looking-but-not case ordinary rather than
+# exotic: the default URL is a real hostname that may simply have no DNS yet, so
+# an install that used to fail fast on a missing ATLAS_SERVER_URL would instead
+# succeed into a dead client.
+#
+# GET /gateway/health, NOT /health. The daemon exempts its own /health
+# (auth.ts EXEMPT_EXACT) but the GATEWAY sits in front on 8443 and gates it —
+# measured against the live server 2026-08-08: /health 401 without a bearer,
+# /gateway/health 200. Probing /health here would have made every tokenless
+# install fail its own reachability check on a perfectly healthy server.
+# /gateway/health needs no token and proves the whole path: DNS, TLS, Caddy,
+# gateway.
+if ! curl -fsS -m 10 -o /dev/null "$SERVER_URL/gateway/health" 2>/dev/null; then
+  if [[ "$SERVER_URL" == "$DEFAULT_SERVER_URL" ]]; then
+    fail "can't reach $SERVER_URL — the public door isn't answering yet.
+  If esoteria gave you a server address, pass it explicitly:
+    ATLAS_SERVER_URL='http://<name>.ts.net:8443' ATLAS_CLIENT_TOKEN='<token>' bash -c \"\$(curl -fsSL $DEFAULT_SERVER_URL/install)\"
+  Otherwise the door is still being set up — ask esoteria before retrying."
+  fi
+  fail "can't reach $SERVER_URL (GET /gateway/health failed).
+  Check the address is right, that you're on the network that can see it, and
+  — for a .ts.net address — that Tailscale is running and signed in."
+fi
+ok "server reachable"
 
 # ── [2/5] Download + verify the app ─────────────────────────────────────────
 step "[2/5] Download Atlas"
@@ -200,11 +265,11 @@ if [[ -d "$APP_PATH" ]]; then
   # Park OUT of /Applications: a parked bundle there haunts Spotlight and
   # Launchpad as a ghost "Atlas" (blank-icon helper apps included — field
   # find 2026-07-12). ~/.atlas/previous.noindex is invisible to Spotlight
-  # (.noindex) and still never deleted.
+  # (.noindex); prune_park below keeps only the newest $PARK_KEEP.
   PARK="$HOME/.atlas/previous.noindex"
   mkdir -p "$PARK"
   mv "$APP_PATH" "$PARK/Atlas.app.prev.$(date +%Y%m%d%H%M%S)"
-  warn "existing Atlas.app parked in $PARK (never deleted)"
+  warn "existing Atlas.app parked in $PARK (newest $PARK_KEEP kept)"
 fi
 # ditto preserves the bundle's code signature (cp -R can break it on the
 # framework symlinks), and the tarball extracts onto tmpfs, so copy properly.
@@ -212,13 +277,18 @@ ditto "$TMP/atlas-client/Atlas.app" "$APP_PATH"
 ok "installed $APP_PATH"
 
 # The previous layout (~/atlas-client, raw electron via npm) is superseded —
-# move it aside so nothing points at it. Never deleted.
+# move it aside so nothing points at it.
 if [[ -d "$HOME/atlas-client" ]]; then
   PARK="$HOME/.atlas/previous.noindex"
   mkdir -p "$PARK"
   mv "$HOME/atlas-client" "$PARK/atlas-client.prev.$(date +%Y%m%d%H%M%S)"
   warn "old-style install ~/atlas-client parked in $PARK (superseded by Atlas.app)"
 fi
+
+# Unconditional (not tied to whether THIS run parked anything): the lots that
+# actually hit 4.3 GB were filled by installs that predate the retention, so
+# the first run of this script has to be the one that cleans them up.
+prune_park
 
 # ── [3/5] The native helper ─────────────────────────────────────────────────
 # WHY THIS STEP EXISTS (defect 2, found on a fresh Mac 2026-08-05). Atlas spawns
@@ -264,10 +334,23 @@ if [[ -f "$HELPER_SRC" ]]; then
   fi
 else
   warn "this Atlas build shipped without the native helper (older release)."
+  HELPER_OK=0
+fi
+
+# "we didn't install one" is NOT the same as "you don't have one" — the two
+# branches above deliberately leave a previously-installed, working helper in
+# place, and the closing advice has to describe the Mac's actual state rather
+# than this run's. Without this, a reinstall of an older build told a user whose
+# globe key works fine that dictation and meeting capture were off, and hid the
+# Accessibility instructions that are the real remaining step.
+if [ "$HELPER_OK" != "1" ] && [ -x "$HELPER_DEST" ] \
+   && "$HELPER_DEST" exclude-screen-capture >/dev/null 2>&1; then
+  ok "kept the working helper already at $HELPER_DEST"
+  HELPER_OK=1
+elif [ "$HELPER_OK" != "1" ]; then
   warn "consequence: the 🌐 globe key won't start dictation (it falls back to"
   warn "Option-Shift-Space), and meeting recording + meeting detection stay off."
   warn "Ask esoteria for a build published after 2026-08-06, then re-run this installer."
-  HELPER_OK=0
 fi
 
 # ── [4/5] Connection config ─────────────────────────────────────────────────
@@ -313,13 +396,30 @@ SERVICE_TARGET="gui/$(id -u)/$PLIST_LABEL"
 # install path is only reachable this way, and a stale label left loaded is
 # exactly what made the next `bootstrap` do nothing.
 launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
+# `bootout` is ASYNCHRONOUS: it returns as soon as the teardown is queued, and a
+# `bootstrap` issued while the old label is still going away fails with EBUSY /
+# "Input/output error (5)". Swallowing that with `|| true` and printing [ok]
+# anyway is the same class of lie this rewrite exists to kill — the user would be
+# told Atlas starts at login when the label never loaded. Retry, then BELIEVE
+# `launchctl print`, not an exit code.
+launchd_loaded() { launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; }
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
+  if launchd_loaded; then break; fi
+  sleep 0.3
+done
 # `kickstart -k` is the line that actually starts the NEW binary. `bootstrap`
 # alone is a silent no-op when the label is already loaded — so on every
 # reinstall it loaded nothing, started nothing, and still fell through to the
 # "[ok] Atlas starts at login" below. -k kills whatever the label is running and
 # restarts it from the plist we just wrote.
-ok "registered to start at login ($PLIST_LABEL)"
+if launchd_loaded; then
+  ok "registered to start at login ($PLIST_LABEL)"
+else
+  warn "could not register Atlas to start at login (launchctl bootstrap failed)."
+  warn "Atlas still works — you'll just have to open it yourself after a reboot."
+  warn "Fix it later with: launchctl bootstrap gui/\$(id -u) \"$PLIST\""
+fi
 # Deliberately NOT an [ok] "Atlas started" here: whether Atlas started, and
 # whether the thing that started is the build we just installed, is not known
 # until the verify below. Claiming it here is the shape of the bug.
