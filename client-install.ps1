@@ -29,6 +29,13 @@
 #                           update is announced, so the click downloads nothing)
 #   ATLAS_SELF_UPDATE=1     set by the app: write the phase / relaunch stamps,
 #                           wait for the app to quit itself at `ready`.
+#   ATLAS_SILENT_UPDATE=1   with ATLAS_SELF_UPDATE=1: an update nobody pressed
+#                           (ADR-1424, the Mac installer's header has the whole
+#                           contract). Only the verified stage, no network, no
+#                           relaunch stamp, and the relaunch is a login boot (no
+#                           window). With ATLAS_CLIENT_NO_LAUNCH=1 it is the Quit
+#                           moment: never reopen, never stop a running Atlas.
+#   ATLAS_QUIT_GRACE_TRIES  0.2 s polls the self-quit gets (default 150). TESTING.
 #
 # THE UPDATE HANDSHAKE (see the Mac installer's header + update-handshake.ts):
 #   ~/.atlas/update-phase     one word: check / download / verify / ready /
@@ -121,6 +128,11 @@ $RunKeyName    = "Atlas"
 $LoginBootFlag = "--atlas-login-boot"   # apps/desktop/src/main/platform.ts LOGIN_BOOT_FLAG
 
 $SelfUpdate = $env:ATLAS_SELF_UPDATE -eq "1"
+# SILENT (ADR-1424): the app asked for this at a quiet moment — a sign-in, the
+# owner away, the owner's own Quit (with NoLaunch). Only under a self-update.
+$Silent   = $SelfUpdate -and ($env:ATLAS_SILENT_UPDATE -eq "1")
+$NoLaunch = $env:ATLAS_CLIENT_NO_LAUNCH -eq "1"
+$QuitGraceTries = if ($env:ATLAS_QUIT_GRACE_TRIES) { [int]$env:ATLAS_QUIT_GRACE_TRIES } else { 150 }
 
 # Run the helper's no-op subcommand and hand back its exit code. Never throws:
 # a helper that cannot start is a REPORTED failure (the caller keeps whatever
@@ -140,7 +152,7 @@ function phase { param($word)
   try { New-Item -ItemType Directory -Force -Path $AtlasStateDir | Out-Null; Set-Content -Path $PhaseFile -Value $word -NoNewline -ErrorAction SilentlyContinue } catch {}
 }
 function stamp_relaunch {
-  if (-not $SelfUpdate) { return }
+  if (-not $SelfUpdate -or $Silent) { return }
   try { New-Item -ItemType Directory -Force -Path $AtlasStateDir | Out-Null; Set-Content -Path $RelaunchFile -Value ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")) -ErrorAction SilentlyContinue } catch {}
 }
 
@@ -165,10 +177,15 @@ if ($SelfUpdate) {
 # every process the new app spawns carried the token, and its next background
 # prefetch ran as a self-update, writing the phase stamps.
 function start_atlas {
-  foreach ($v in "ATLAS_CLIENT_TOKEN", "ATLAS_SERVER_URL", "ATLAS_SELF_UPDATE", "ATLAS_PREFETCH_ONLY") {
+  foreach ($v in "ATLAS_CLIENT_TOKEN", "ATLAS_SERVER_URL", "ATLAS_SELF_UPDATE", "ATLAS_PREFETCH_ONLY", "ATLAS_SILENT_UPDATE", "ATLAS_CLIENT_NO_LAUNCH") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
   }
-  Start-Process -FilePath $ExePath -WorkingDirectory $AppDir
+  # A silent update's relaunch is a SIGN-IN start, not the owner opening Atlas
+  # (ADR-1424): the login-boot flag keeps it menubar-quiet (first-run.ts
+  # isUserLaunch). The app writes the relaunch stamp itself when it wants its
+  # window back.
+  if ($Silent) { Start-Process -FilePath $ExePath -WorkingDirectory $AppDir -ArgumentList $LoginBootFlag }
+  else { Start-Process -FilePath $ExePath -WorkingDirectory $AppDir }
 }
 
 # ── Which Atlas is running ──────────────────────────────────────────────────
@@ -192,7 +209,7 @@ function atlas_gone { param([int]$tries)
 # insist (CloseMainWindow → WM_CLOSE), then compel (Stop-Process).
 function quit_atlas {
   if (-not (atlas_procs)) { return $true }
-  if ($SelfUpdate -and (atlas_gone 150)) { return $true }   # ~30 s for the self-quit
+  if ($SelfUpdate -and (atlas_gone $QuitGraceTries)) { return $true }   # ~30 s for the self-quit
   atlas_procs | ForEach-Object { try { $_.CloseMainWindow() | Out-Null } catch {} }
   if (atlas_gone 25) { return $true }
   atlas_procs | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
@@ -205,7 +222,8 @@ $script:Status = 1
 function finish {
   if ($Tmp -and (Test-Path $Tmp)) { Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue }
   if ($script:Status -ne 0) { phase "failed" } else { Remove-Item $PhaseFile -ErrorAction SilentlyContinue }
-  if ($script:Status -ne 0 -and $SelfUpdate -and -not (atlas_procs) -and (Test-Path $ExePath)) {
+  # Never on the Quit moment (ADR-1424): the owner closed Atlas on purpose.
+  if ($script:Status -ne 0 -and $SelfUpdate -and -not ($Silent -and $NoLaunch) -and -not (atlas_procs) -and (Test-Path $ExePath)) {
     warn "the update did not finish - reopening the Atlas that is still installed"
     stamp_relaunch
     try { start_atlas } catch {}
@@ -253,12 +271,16 @@ ok "server + token provided"
 # Reach the server BEFORE downloading ~200 MB. /gateway/health needs no token
 # and proves DNS, TLS and the gateway (the Mac installer's note explains why
 # not /health).
-try {
-  Invoke-WebRequest -Uri "$ServerUrl/gateway/health" -UseBasicParsing -TimeoutSec 10 | Out-Null
-} catch {
-  fail "can't reach $ServerUrl (GET /gateway/health failed: $($_.Exception.Message)). Check the address, and that you're on a network that can see it."
+# A SILENT install touches no network (ADR-1424): it installs a stage verified
+# when it landed, often at a sign-in before the network is up.
+if (-not $Silent) {
+  try {
+    Invoke-WebRequest -Uri "$ServerUrl/gateway/health" -UseBasicParsing -TimeoutSec 10 | Out-Null
+  } catch {
+    fail "can't reach $ServerUrl (GET /gateway/health failed: $($_.Exception.Message)). Check the address, and that you're on a network that can see it."
+  }
+  ok "server reachable"
 }
-ok "server reachable"
 
 # ── [2/5] Download + verify the app ─────────────────────────────────────────
 step "[2/5] Download Atlas"
@@ -302,6 +324,19 @@ function stage_payload {
   $script:Staged = Join-Path $StagingDir $ZipAsset
   $stagedSha = Join-Path $StagingDir $ShaAsset
   $part = "$script:Staged.part"
+  if ($Silent) {
+    # SILENT (ADR-1424): the stage the prefetch verified against the published
+    # checksum (kept beside it), or nothing — never a download.
+    phase "verify"
+    if ((Test-Path $script:Staged) -and (Test-Path $stagedSha)) {
+      $kept = ((Get-Content $stagedSha -Raw) -split '\s+')[0].ToLowerInvariant()
+      if ($kept -match '^[0-9a-f]{64}$' -and (sha_of $script:Staged) -eq $kept) {
+        ok "installing the staged payload ($script:Staged) - silent, no network"
+        return
+      }
+    }
+    fail "nothing verified is staged - a silent install never downloads"
+  }
   phase "download"
   $shaFile = Join-Path $Tmp $ShaAsset
   if (-not (fetch -Url $ShaUrl -Out $shaFile -Small)) {
@@ -356,7 +391,13 @@ if (-not $NewApp) { fail "the bundle is missing Atlas.exe (stale release? try ag
 # READY — the payload is verified and extracted; the live app is now the only
 # thing in the way. The app polls for this word and quits on it.
 phase "ready"
-if (atlas_procs) {
+if ($Silent -and $NoLaunch) {
+  # THE QUIT MOMENT (ADR-1424): Atlas is exiting on the owner's own Quit. Wait
+  # for it, but never push — an Atlas still here after the grace is one the
+  # owner opened again. It keeps the stage for the next quiet moment.
+  if (atlas_gone $QuitGraceTries) { ok "Atlas has quit - swapping in the staged build" }
+  else { fail "Atlas is running again - leaving the update staged for the next quiet moment" }
+} elseif (atlas_procs) {
   if (quit_atlas) { ok "quit the running Atlas" }
   else { warn "an Atlas process would not exit; the new build will be installed, but quit Atlas by hand if the check at the end says the wrong build is live" }
 } else {
