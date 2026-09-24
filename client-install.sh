@@ -33,6 +33,19 @@
 #                           runs this in the background the moment an update is
 #                           announced, so that the click later has nothing left
 #                           to download (ADR-939).
+#   ATLAS_SILENT_UPDATE=1   with ATLAS_SELF_UPDATE=1: an update nobody pressed
+#                           (ADR-1424) — the app runs it at a quiet moment (a
+#                           login boot, the owner away, the owner's own Quit).
+#                           Installs ONLY the stage a prefetch verified, with no
+#                           network at all; writes no relaunch stamp (the app
+#                           writes one itself when it wants its window back);
+#                           and a failure reopens Atlas the way launchd starts
+#                           it at login — no window. Add ATLAS_CLIENT_NO_LAUNCH=1
+#                           for the Quit moment: nothing is launched or
+#                           reopened, and an Atlas still running at the swap (the
+#                           owner reopened it) is never quit — the update waits.
+#   ATLAS_QUIT_GRACE_TRIES  how many 0.2 s polls the self-quit gets (default 150,
+#                           ~30 s). TESTING only.
 
 set -euo pipefail
 
@@ -82,6 +95,11 @@ RELAUNCH_FILE="$ATLAS_STATE_DIR/update-relaunch"
 # the published .sha256 (86 bytes) and trusts the stage only if it matches, so
 # a release re-cut under the same number is still downloaded fresh.
 STAGING_DIR="$ATLAS_STATE_DIR/staging"
+# SILENT (ADR-1424) — see ATLAS_SILENT_UPDATE above. Only ever under a
+# self-update: the flag means "the app asked for this at a quiet moment".
+SILENT=0
+if [ "${ATLAS_SELF_UPDATE:-}" = "1" ] && [ "${ATLAS_SILENT_UPDATE:-}" = "1" ]; then SILENT=1; fi
+QUIT_GRACE_TRIES="${ATLAS_QUIT_GRACE_TRIES:-150}"
 
 # Never fatal: `set -e` is on, and an unwritable ~/.atlas must cost the owner a
 # progress word, not their update.
@@ -93,6 +111,9 @@ phase() {
 
 stamp_relaunch() {
   [ "${ATLAS_SELF_UPDATE:-}" = "1" ] || return 0
+  # A silent install's window is the APP's call (it stamps before quitting when
+  # the owner had the window open); the installer never invents one.
+  [ "$SILENT" = "1" ] && return 0
   mkdir -p "$ATLAS_STATE_DIR" 2>/dev/null || return 0
   date -u +%Y-%m-%dT%H:%M:%SZ > "$RELAUNCH_FILE" 2>/dev/null || true
 }
@@ -209,7 +230,7 @@ quit_atlas() {
   # down the pollers, tap helper and windows) now has to fit inside this window.
   # Overrunning it would escalate straight to the osascript rung this design
   # exists to avoid.
-  if [ "${ATLAS_SELF_UPDATE:-}" = "1" ] && atlas_gone 150; then return 0; fi
+  if [ "${ATLAS_SELF_UPDATE:-}" = "1" ] && atlas_gone "$QUIT_GRACE_TRIES"; then return 0; fi
   osascript -e 'tell application "Atlas" to quit' >/dev/null 2>&1 || true
   if atlas_gone 25; then return 0; fi   # ~5s for a graceful Electron shutdown
   pkill -a -x Atlas 2>/dev/null || true # SIGTERM
@@ -289,15 +310,28 @@ on_exit() {
   else
     rm -f "$PHASE_FILE" 2>/dev/null || true
   fi
-  if [ "$status" -ne 0 ] && [ "${ATLAS_SELF_UPDATE:-}" = "1" ] \
+  # Never on the Quit moment (silent + ATLAS_CLIENT_NO_LAUNCH, ADR-1424): the
+  # owner closed Atlas on purpose, and a failed update nobody pressed is no
+  # reason to open it on them.
+  local quit_moment=0
+  if [ "$SILENT" = "1" ] && [ "${ATLAS_CLIENT_NO_LAUNCH:-}" = "1" ]; then quit_moment=1; fi
+  if [ "$status" -ne 0 ] && [ "${ATLAS_SELF_UPDATE:-}" = "1" ] && [ "$quit_moment" = "0" ] \
      && [ -z "$(atlas_pids)" ] && [ -d "$APP_PATH" ]; then
     warn "the update did not finish — reopening the Atlas that is still installed"
-    # `open` brings Atlas to the front; it does NOT give it a window, because a
-    # launch with setup already done is menubar-quiet. An owner whose update
-    # just failed is the last person who should be left looking at nothing, so
-    # the reopen carries the same stamp a successful relaunch does.
-    stamp_relaunch
-    open "$APP_PATH" 2>/dev/null || true
+    if [ "$SILENT" = "1" ]; then
+      # Nobody pressed anything, so nobody is waiting for a window: bring Atlas
+      # back the way it runs at login (launchd, menubar-quiet). The login-boot
+      # flag keeps even the `open` fallback quiet (first-run.ts isUserLaunch).
+      launchctl kickstart "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1 \
+        || open -g "$APP_PATH" --args --atlas-login-boot 2>/dev/null || true
+    else
+      # `open` brings Atlas to the front; it does NOT give it a window, because a
+      # launch with setup already done is menubar-quiet. An owner whose update
+      # just failed is the last person who should be left looking at nothing, so
+      # the reopen carries the same stamp a successful relaunch does.
+      stamp_relaunch
+      open "$APP_PATH" 2>/dev/null || true
+    fi
   fi
 }
 trap on_exit EXIT
@@ -389,7 +423,10 @@ fi
 # install fail its own reachability check on a perfectly healthy server.
 # /gateway/health needs no token and proves the whole path: DNS, TLS, Caddy,
 # gateway.
-if ! curl -fsS -m 10 -o /dev/null "$SERVER_URL/gateway/health" 2>/dev/null; then
+# A SILENT install touches no network (ADR-1424): it installs a stage that was
+# verified when it landed, at a moment the network may well be down (a login
+# boot before Wi-Fi joins). The probe below is for installs that download.
+if [ "$SILENT" != "1" ] && ! curl -fsS -m 10 -o /dev/null "$SERVER_URL/gateway/health" 2>/dev/null; then
   if [[ "$SERVER_URL" == "$DEFAULT_SERVER_URL" ]]; then
     fail "can't reach $SERVER_URL — the public door isn't answering yet.
   If esoteria gave you a server address, pass it explicitly:
@@ -434,6 +471,21 @@ stage_payload() {
   STAGED_TARBALL="$STAGING_DIR/$TARBALL_ASSET"
   STAGED_SHA="$STAGING_DIR/$SHA_ASSET"
   local part="$STAGED_TARBALL.part" want
+  if [ "$SILENT" = "1" ]; then
+    # SILENT (ADR-1424): the stage the prefetch verified against the published
+    # checksum (kept beside it), or nothing. Never a download: this runs when
+    # nobody asked, so it must be seconds long and must not spend the owner's
+    # bandwidth on a payload nobody knows is still the latest.
+    phase verify
+    local kept
+    kept="$(cut -d' ' -f1 "$STAGED_SHA" 2>/dev/null || true)"
+    if [[ -f "$STAGED_TARBALL" && "$kept" =~ ^[0-9a-f]{64}$ ]] \
+       && [[ "$(sha_of "$STAGED_TARBALL")" == "$kept" ]]; then
+      ok "installing the staged payload ($STAGED_TARBALL) — silent, no network"
+      return 0
+    fi
+    fail "nothing verified is staged — a silent install never downloads"
+  fi
   phase download
   if ! curl -fsSL "${CURL_SMALL[@]}" -o "$TMP/$SHA_ASSET" "$SHA_URL"; then
     if [[ "${ATLAS_PREFETCH_ONLY:-}" != "1" ]] && [[ -f "$STAGED_TARBALL" && -f "$STAGED_SHA" ]] \
@@ -496,7 +548,17 @@ phase ready
 # defect 1. Unconditional (not gated on `-d $APP_PATH`) because the running build
 # may live somewhere else entirely, e.g. an older ~/Applications install.
 QUIT_GATE_PIDS="$(atlas_pids | tr '\n' ' ')"
-if [ -n "$(printf '%s' "$QUIT_GATE_PIDS" | tr -d '[:space:]')" ]; then
+if [ "$SILENT" = "1" ] && [ "${ATLAS_CLIENT_NO_LAUNCH:-}" = "1" ]; then
+  # THE QUIT MOMENT (ADR-1424). Atlas is exiting on the owner's own Quit and
+  # started this on its way out. Wait for that exit — but never push: an Atlas
+  # still here after the grace is one the owner opened again, and quitting it
+  # would read as a crash. It keeps the stage; the next quiet moment installs.
+  if atlas_gone "$QUIT_GRACE_TRIES"; then
+    ok "Atlas has quit — swapping in the staged build"
+  else
+    fail "Atlas is running again — leaving the update staged for the next quiet moment"
+  fi
+elif [ -n "$(printf '%s' "$QUIT_GATE_PIDS" | tr -d '[:space:]')" ]; then
   if quit_atlas; then
     ok "quit the running Atlas (was pids: $QUIT_GATE_PIDS)"
   else
