@@ -282,6 +282,28 @@ if (-not $Silent) {
   ok "server reachable"
 }
 
+# THE TOKEN, PROVEN BEFORE THE DOWNLOAD (the Mac installer's note explains
+# why): a wrong token used to install as all-[ok] into an app stuck offline.
+# Only a 401 fails; a 502 means the gateway knew the token (the daemon is
+# restarting), anything else warns and carries on. Hand-run installs only —
+# an update reuses the token the app already holds.
+if (-not $SelfUpdate -and $env:ATLAS_PREFETCH_ONLY -ne "1") {
+  $tokenCode = 0
+  try {
+    $tokenCode = [int](Invoke-WebRequest -Uri "$ServerUrl/health" -UseBasicParsing -TimeoutSec 10 `
+      -Headers @{ Authorization = "Bearer $Token" }).StatusCode
+  } catch {
+    if ($_.Exception.Response) { $tokenCode = [int]$_.Exception.Response.StatusCode }
+  }
+  if ($tokenCode -eq 401) {
+    fail "the server rejected your access token - nothing was installed. Check you pasted the WHOLE token from esoteria (one long line of letters and digits, no spaces), then run the same command again. If it still fails, the token may have been replaced - ask esoteria for your current one."
+  } elseif (($tokenCode -ge 200 -and $tokenCode -lt 300) -or $tokenCode -eq 502) {
+    ok "access token accepted"
+  } else {
+    warn "couldn't confirm your access token (server answered $(if ($tokenCode) { $tokenCode } else { 'nothing' })) - installing anyway"
+  }
+}
+
 # ── [2/5] Download + verify the app ─────────────────────────────────────────
 step "[2/5] Download Atlas"
 $Tmp = Join-Path ([IO.Path]::GetTempPath()) ("atlas-install-" + [Guid]::NewGuid().ToString("N"))
