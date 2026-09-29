@@ -439,6 +439,29 @@ if [ "$SILENT" != "1" ] && ! curl -fsS -m 10 -o /dev/null "$SERVER_URL/gateway/h
 fi
 ok "server reachable"
 
+# THE TOKEN, PROVEN BEFORE THE DOWNLOAD. A mistyped, truncated or rotated token
+# used to sail through every step as [ok] and land an app that could never
+# connect — the only symptom a UI stuck on "You're offline". One authenticated
+# GET /health settles it: the gateway answers an unknown bearer 401 itself,
+# before any daemon is involved. ONLY a 401 fails the install — a 502 means the
+# gateway recognised the token and the profile's daemon is merely restarting,
+# and anything else (a timeout, a 429 from the auth throttle) is not proof the
+# token is wrong, so it warns and carries on. A hand-run install only: an update
+# (ATLAS_SELF_UPDATE / prefetch / silent) reuses the token the app already holds
+# and must never be rolled back by this check.
+if [ "$SILENT" != "1" ] && [ "${ATLAS_SELF_UPDATE:-}" != "1" ] && [ "${ATLAS_PREFETCH_ONLY:-}" != "1" ]; then
+  TOKEN_CODE=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" "$SERVER_URL/health" 2>/dev/null) || true
+  case "$TOKEN_CODE" in
+    401) fail "the server rejected your access token — nothing was installed.
+  Check you pasted the WHOLE token from esoteria (it is one long line of letters
+  and digits, no spaces), then run the same command again. If it still fails, the
+  token may have been replaced — ask esoteria for your current one." ;;
+    2??|502) ok "access token accepted" ;;
+    *) warn "couldn't confirm your access token (server answered ${TOKEN_CODE:-nothing}) — installing anyway" ;;
+  esac
+fi
+
 # ── [2/5] Download + verify the app ─────────────────────────────────────────
 step "[2/5] Download Atlas"
 TMP=$(mktemp -d)   # cleaned up by on_exit (the single EXIT trap above)
